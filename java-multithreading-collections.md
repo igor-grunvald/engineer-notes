@@ -73,6 +73,25 @@
 - Не допускает `null` ни для ключей, ни для значений
 - Итераторы fail-safe (weakly consistent) — не выбрасывают `ConcurrentModificationException`
 
+**Базовое использование:**
+
+```java
+ConcurrentHashMap<String, Integer> map = new ConcurrentHashMap<>();
+
+// Атомарные операции
+map.putIfAbsent("key1", 1);              // Вставит, только если ключа нет
+map.computeIfAbsent("key2", k -> k.length()); // Вычислит и вставит
+map.compute("key1", (k, v) -> v + 1);    // Атомарный инкремент значения
+map.merge("key2", 1, Integer::sum);      // Атомарное слияние
+
+// Поиск
+map.search(10, (k, v) -> v > 5 ? k : null); // Параллельный поиск (порог 10)
+// Агрегация
+map.reduce(10, (k, v) -> v, Integer::sum);  // Параллельная редукция
+// forEach с параллелизмом
+map.forEach(10, (k, v) -> System.out.println(k + "=" + v));
+```
+
 **Внутреннее устройство:**
 - В Java 7: сегментная блокировка (16 сегментов)
 - В Java 8+: блокировка на уровне головы корзины + CAS для пустых корзин
@@ -166,6 +185,28 @@
 - Чтение происходит мгновенно и без блокировок
 - Поток читает неизменяемый "снимок" (snapshot) данных
 - Итератор обходит массив, который был актуален в момент создания итератора
+
+**Практический пример — реестр слушателей (listener registry):**
+
+```java
+class EventBus {
+    // Слушателей регистрируют редко, а оповещают часто — идеально для COW
+    private final CopyOnWriteArrayList<EventListener> listeners = new CopyOnWriteArrayList<>();
+
+    public void register(EventListener listener) {
+        listeners.add(listener);  // Редкая операция — копирование массива
+    }
+
+    public void fireEvent(Event event) {
+        // Частая операция — без блокировок, snapshot итератор
+        for (EventListener listener : listeners) {
+            listener.onEvent(event);
+        }
+        // Даже если во время итерации кто-то добавил/удалил слушателя,
+        // этот цикл пройдёт по "снимку" на момент начала итерации
+    }
+}
+```
 
 **Особенности итератора:**
 - Не выбрасывает `ConcurrentModificationException` при изменении списка
@@ -273,6 +314,32 @@
 - Может работать в fair и non-fair режиме
 - По сути — rendezvous point (точка рандеву) для потоков
 
+**Пример — прямая передача задачи «из рук в руки»:**
+
+```java
+SynchronousQueue<String> queue = new SynchronousQueue<>();
+
+// Producer — блокируется, пока Consumer не заберёт
+new Thread(() -> {
+    System.out.println("Producer: готов передать задачу...");
+    queue.put("Задача от Producer");
+    System.out.println("Producer: задача передана!");
+}).start();
+
+Thread.sleep(100); // Даём Producer'у заблокироваться
+
+// Consumer — разблокирует Producer при вызове take()
+new Thread(() -> {
+    System.out.println("Consumer: жду задачу...");
+    String task = queue.take();
+    System.out.println("Consumer: получил '" + task + "'");
+}).start();
+```
+
+**Два режима (spinning vs parking):**
+- **Non-fair (по умолчанию)**: использует spin-loop перед парковкой — поток крутится в цикле некоторое время, прежде чем припарковаться. Лучше для low-latency сценариев.
+- **Fair**: FIFO-очередь ожидающих потоков. Гарантирует, что самый «старый» ожидающий поток получит элемент первым. Лучше для throughput.
+
 ---
 
 ### 4.5. DelayQueue
@@ -285,10 +352,54 @@
 - `take()` блокируется, пока не истечёт задержка у первого элемента
 - `poll()` возвращает `null`, если ни один элемент не готов
 
+**Практический пример — простой планировщик с задержкой:**
+
+```java
+class DelayedTask implements Delayed {
+    private final String name;
+    private final long startTime; // Время в наносекундах, когда задача должна выполниться
+
+    public DelayedTask(String name, long delayMs) {
+        this.name = name;
+        this.startTime = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(delayMs);
+    }
+
+    @Override
+    public long getDelay(TimeUnit unit) {
+        long remaining = startTime - System.nanoTime();
+        return unit.convert(remaining, TimeUnit.NANOSECONDS);
+    }
+
+    @Override
+    public int compareTo(Delayed other) {
+        return Long.compare(this.startTime, ((DelayedTask) other).startTime);
+    }
+
+    public void execute() {
+        System.out.println(Thread.currentThread().getName() + ": выполняю " + name);
+    }
+}
+
+// Использование:
+DelayQueue<DelayedTask> scheduler = new DelayQueue<>();
+scheduler.put(new DelayedTask("Задача A", 2000)); // Через 2 сек
+scheduler.put(new DelayedTask("Задача B", 1000)); // Через 1 сек
+
+// Поток-исполнитель
+new Thread(() -> {
+    while (true) {
+        DelayedTask task = scheduler.take(); // Блокируется до готовности ближайшей
+        task.execute();
+    }
+}).start();
+// Вывод: сначала "Задача B", через секунду "Задача A"
+```
+
 **Применение:**
-- Кэши с истечением времени
+- Кэши с истечением времени (TTL cache)
 - Планировщики задач (ScheduledThreadPoolExecutor использует внутри DelayQueue)
 - Обработка сессий с таймаутами
+- Rate limiting (ограничение частоты запросов)
 
 ---
 
@@ -462,15 +573,47 @@
 
 **Пример проблемы:**
 ```java
+// Плохо — неатомарная составная операция
 if (!map.containsKey(key)) {
     map.put(key, value); // Другой поток мог уже вставить значение!
 }
+```
+
+**Реальные сценарии, где это проявляется:**
+
+```java
+// Сценарий 1: Инициализация кэша (ленивая)
+// Плохо — может вызвать вычисление дважды
+if (!cache.containsKey(key)) {
+    cache.put(key, expensiveComputation(key)); // Гонка!
+}
+
+// Хорошо — атомарно
+cache.computeIfAbsent(key, k -> expensiveComputation(k));
+
+// Сценарий 2: Инкремент счётчика
+// Плохо
+Integer count = map.get(key);
+if (count != null) {
+    map.put(key, count + 1); // Гонка — можно потерять обновления
+}
+// Хорошо
+map.merge(key, 1, Integer::sum);
+
+// Сценарий 3: Условное удаление
+// Плохо
+if (map.get(key) != null && map.get(key) < 0) {
+    map.remove(key); // Другой поток мог изменить значение между get и remove
+}
+// Хорошо
+map.computeIfPresent(key, (k, v) -> v < 0 ? null : v);
 ```
 
 **Решение:** Использовать атомарные методы:
 - `putIfAbsent(key, value)` — вставляет, только если ключа нет
 - `computeIfAbsent(key, function)` — вычисляет и вставляет, если ключа нет
 - `compute(key, function)` — атомарно вычисляет новое значение
+- `computeIfPresent(key, function)` — атомарно обновляет существующее значение
 - `merge(key, value, remappingFunction)` — атомарно сливает значения
 
 ---
@@ -682,7 +825,43 @@ map.merge(key, 1, Integer::sum); // Атомарный инкремент
 - При вызове `sum()` значения всех ячеек суммируются
 - Аналогичен CounterCell в CHM
 
-**LongAdder vs AtomicLong:**
+**LongAdder vs AtomicLong — практическое сравнение:**
+
+```java
+// Сценарий: 16 потоков инкрементируют один счётчик 1 000 000 раз каждый
+
+// AtomicLong — плохо при высокой конкуренции
+AtomicLong atomicCounter = new AtomicLong();
+ExecutorService pool = Executors.newFixedThreadPool(16);
+for (int i = 0; i < 16; i++) {
+    pool.submit(() -> {
+        for (int j = 0; j < 1_000_000; j++) {
+            atomicCounter.incrementAndGet(); // CAS-loop при высокой конкуренции
+        }
+    });
+}
+pool.shutdown();
+pool.awaitTermination(10, TimeUnit.SECONDS);
+// AtomicLong: ~2-3 секунды (много CAS-промахов)
+
+// LongAdder — хорошо при высокой конкуренции
+LongAdder adderCounter = new LongAdder();
+ExecutorService pool2 = Executors.newFixedThreadPool(16);
+for (int i = 0; i < 16; i++) {
+    pool2.submit(() -> {
+        for (int j = 0; j < 1_000_000; j++) {
+            adderCounter.increment(); // Пишет в свою ячейку, без contention
+        }
+    });
+}
+pool2.shutdown();
+pool2.awaitTermination(10, TimeUnit.SECONDS);
+// LongAdder: ~0.2-0.3 секунды (в 10 раз быстрее)
+long result = adderCounter.sum(); // Суммируем все ячейки
+```
+
+**Важно:** `sum()` в LongAdder возвращает **приблизительное** значение в момент вызова, так как другие потоки могут одновременно обновлять ячейки. Для точного значения нужно внешнее согласование (например, дождаться завершения всех потоков).
+
 | Характеристика | AtomicLong | LongAdder |
 |---------------|-----------|-----------|
 | Конкуренция | CAS на одной переменной | Разделение на ячейки |
@@ -778,7 +957,7 @@ Level 0:  1->2->3->4->5->6->7->8->9
 
 Producer вызывает `put()`, Consumer вызывает `take()`. Синхронизация и ожидание происходят автоматически внутри очереди.
 
-**Пример:**
+**Базовый пример:**
 ```java
 BlockingQueue<Item> queue = new ArrayBlockingQueue<>(100);
 
@@ -803,11 +982,63 @@ class Consumer implements Runnable {
 }
 ```
 
+**Продвинутый пример — многопоточный логгер с graceful shutdown:**
+
+```java
+class AsyncLogger implements AutoCloseable {
+    private final BlockingQueue<String> queue;
+    private final Thread worker;
+    private volatile boolean running = true;
+
+    public AsyncLogger(int capacity) {
+        this.queue = new ArrayBlockingQueue<>(capacity);
+        this.worker = new Thread(() -> {
+            while (running || !queue.isEmpty()) {
+                try {
+                    // poll с таймаутом — чтобы проверять running периодически
+                    String message = queue.poll(500, TimeUnit.MILLISECONDS);
+                    if (message != null) {
+                        writeToDisk(message); // Медленная операция I/O
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            // Дописываем оставшееся
+            queue.forEach(this::writeToDisk);
+        }, "logger-thread");
+        worker.start();
+    }
+
+    public void log(String message) {
+        // offer вместо put — не блокируем вызывающий поток навсегда
+        if (!queue.offer(message)) {
+            System.err.println("LOG QUEUE FULL — dropping: " + message);
+        }
+    }
+
+    @Override
+    public void close() {
+        running = false;
+        worker.interrupt(); // Прерываем poll с таймаутом
+        try {
+            worker.join(5000); // Ждём завершения
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    private void writeToDisk(String message) { /* ... */ }
+}
+```
+
 **Преимущества:**
 - Автоматическая синхронизация
 - Автоматическое ожидание (блокировка)
 - Нет необходимости в wait/notify
 - Возможность использовать bounded очереди для backpressure
+- `offer()` с возвратом `false` позволяет реализовать политику при переполнении (drop, block caller, throw)
 
 ---
 

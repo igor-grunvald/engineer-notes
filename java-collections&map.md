@@ -16,6 +16,7 @@
   - [2.7. Может ли ArrayList\<Integer\> быть равен LinkedList\<Integer\>?](#27-может-ли-arraylistinteger-быть-равен-linkedlistinteger)
   - [2.8. В чём разница между Iterable и Iterator?](#28-в-чём-разница-между-iterable-и-iterator)
   - [2.9. Почему одни коллекции проверяют дубликаты через equals(), а другие — через compareTo()/compare()?](#29-почему-одни-коллекции-проверяют-дубликаты-через-equals-а-другие--через-comparetocompare)
+  - [2.10. Что такое Comparable и Comparator? Чем отличаются? Для чего используются?](#210-что-такое-comparable-и-comparator-чем-отличаются-для-чего-используются)
 - [3. List и реализации](#3-list-и-реализации)
   - [3.1. Какие реализации List вы знаете? В чём их различия?](#31-какие-реализации-list-вы-знаете-в-чём-их-различия)
   - [3.2. Как устроен ArrayList внутри? Как происходит увеличение размера?](#32-как-устроен-arraylist-внутри-как-происходит-увеличение-размера)
@@ -436,6 +437,52 @@ System.out.println(hash.size()); // 2
 ```
 
 > **Правило**: для `TreeSet`/`TreeMap` контракт «compareTo == 0 ⟺ equals == true» настоятельно рекомендован (хотя и не обязателен). Если нарушить — поведение будет неочевидным.
+
+### 2.10. Что такое Comparable и Comparator? Чем отличаются? Для чего используются?
+
+`Comparable` и `Comparator` — интерфейсы для определения порядка сортировки объектов.
+
+- **`Comparable`** (`java.lang.Comparable`): определяет **естественный порядок** (natural ordering). Реализуется самим классом. Метод: `int compareTo(T o)`. Возвращает: `<0` — меньше, `0` — равно, `>0` — больше. Один способ сортировки на класс.
+- **`Comparator`** (`java.util.Comparator`): определяет **пользовательский порядок**. Реализуется отдельным классом (или передаётся как лямбда). Метод: `int compare(T o1, T o2)`. Можно создать несколько компараторов для разных критериев сортировки.
+
+**Где используются:**
+- Сортировка коллекций: `Collections.sort()`, `List.sort()`
+- Сортированные коллекции: `TreeSet`, `TreeMap`
+- Очереди с приоритетом: `PriorityQueue`
+- Stream API: `.sorted()`, `Collectors.maxBy()`, `Collectors.minBy()`
+- Сортировка массивов: `Arrays.sort(T[], Comparator)`
+
+**Ключевое различие:**
+
+| Характеристика | `Comparable` | `Comparator` |
+|---------------|-------------|-------------|
+| **Пакет** | `java.lang` | `java.util` |
+| **Метод** | `compareTo(T o)` | `compare(T o1, T o2)` |
+| **Где реализуется** | В самом классе элементов | Отдельно от класса |
+| **Количество стратегий** | Одна (natural order) | Сколько угодно |
+| **Контроль над кодом** | Требует изменения класса | Не требует изменения класса |
+| **Пример** | `String`, `Integer`, `LocalDate` | `Comparator.comparing(User::getName)` |
+
+```java
+// Comparable — класс сам знает, как себя сравнивать:
+record Player(String name, int score) implements Comparable<Player> {
+    @Override
+    public int compareTo(Player other) {
+        return Integer.compare(this.score, other.score); // natural order: по очкам
+    }
+}
+
+// Comparator — внешняя стратегия сортировки:
+Comparator<Player> byName = Comparator.comparing(Player::name);
+Comparator<Player> byScoreDesc = Comparator.comparingInt(Player::score).reversed();
+
+List<Player> players = new ArrayList<>(List.of(
+    new Player("Alice", 100), new Player("Bob", 200)));
+players.sort(byName);              // сортировка по имени
+players.sort(byScoreDesc);         // сортировка по очкам (убывание)
+```
+
+> **Примечание**: подробнее о `Comparable`/`Comparator` в контексте конкретных коллекций — см. разделы [2.9](#29-почему-одни-коллекции-проверяют-дубликаты-через-equals-а-другие--через-comparetocompare), [4.9–4.11](#49-как-работает-treeset-какие-требования-к-элементам), [5.7](#57-чем-comparator-отличается-от-естественного-порядка-comparable), [6.19](#619-можно-ли-использовать-treemap-без-comparator-что-будет-если-ключи-не-comparable), [10.7](#107-как-отсортировать-list-объектов-по-нескольким-полям-через-comparator).
 
 ---
 
